@@ -1,0 +1,23 @@
+# Private local grab history & snippets
+data/
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Compiled binaries (build from ocr_engine.cs)
+*.exe
+*.pdb
+
+# Temporary OCR / OS / IDE files
+tg_ocr_*.png
+*.tmp
+.env
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
