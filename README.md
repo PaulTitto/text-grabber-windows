@@ -1,71 +1,71 @@
 # Text Grabber
 
-Aplikasi desktop Windows untuk mengekstrak teks yang terjebak di dalam gambar, video, PDF, atau bagian aplikasi yang tidak bisa di-*select* — berjalan **100% lokal dan offline** di perangkat Anda menggunakan engine OCR bawaan Windows (`Windows.Media.Ocr.OcrEngine`).
+A clean, modern Windows desktop application for extracting text trapped inside images, videos, PDFs, and non-selectable UI elements — running **100% locally and offline** on your device using the built-in Windows OCR engine (`Windows.Media.Ocr.OcrEngine`).
 
-- **Tanpa koneksi internet**
-- **Tanpa layanan cloud**
-- **Tanpa biaya per penggunaan**
-- **Privasi terjaga** — gambar tidak disimpan permanen; file sementara dihapus otomatis segera setelah OCR selesai.
+- **No internet connection required**
+- **No cloud service**
+- **No per-use cost**
+- **Local & private** — screenshots and images are never saved permanently; temporary files are deleted immediately after OCR finishes.
 
 ---
 
-## Fitur Utama
+## Key Features
 
-### 1. Mode Pengambilan Teks (Capture Modes)
-- **Grab Screen (`Ctrl + Shift + G`)**: Tangkap area layar mana saja dengan overlay drag-to-select.
-- **Grab Frame (`Ctrl + Shift + F`)**: Jendela frame mengambang (*always-on-top*) untuk diarahkan ke video atau jendela aplikasi lalu klik **Grab**.
-- **Open Image / PDF**: Buka file gambar (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.tiff`, `.gif`) atau dokumen `.pdf` (dengan navigasi per halaman, OCR halaman aktif, atau **OCR All Pages**).
-- **Paste Image (`Ctrl + V`)**: Jalankan OCR langsung dari gambar di clipboard.
-- **Region Preview**: Tarik kotak langsung pada gambar di panel *Preview* untuk OCR sebagian area saja.
+### 1. Capture Modes
+- **Grab Screen (`Ctrl + Shift + G`)**: Capture any region on your screen using a drag-to-select overlay.
+- **Grab Frame (`Ctrl + Shift + F`)**: Floating always-on-top frame you can position over videos or app windows and click **Grab**.
+- **Open File**: Open images (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.tiff`, `.gif`) or `.pdf` documents (with page navigation, single-page OCR, or **OCR All Pages**).
+- **Paste (`Ctrl + V`)**: Run OCR directly on an image from the clipboard.
+- **Preview Region Selection**: Drag a rectangle directly on the preview image to OCR a specific sub-region.
 
-### 2. Mode Output
-- **Standard**: Ekstraksi multi-baris normal.
-- **1-Line**: Menggabungkan hasil OCR menjadi satu baris rapi.
-- **Table**: Merekonstruksi posisi kata berdasarkan koordinat menjadi tabel siap-spreadsheet.
+### 2. Output Modes
+- **Standard**: Normal multi-line text extraction.
+- **1-Line**: Joins extracted text into a single clean line.
+- **Table**: Reconstructs word coordinates into a structured spreadsheet table.
 
 ### 3. Editor & Post-Grab Cleanup
-- **Cleanup Drawer (`✦ Cleanup`)**: *Trim Spaces*, *No Blank Lines*, *Unwrap Lines*, *ASCII Only*, *Deduplicate*, *Sort A-Z*, *UPPER / lower / Title Case*, dan *Find & Replace* (mendukung Regex).
-- **Auto-Copy**: Otomatis menyalin hasil OCR ke clipboard setiap selesai grab.
-- Simpan hasil ke file `.txt` atau simpan sebagai **Snippet**.
+- **Cleanup Drawer (`✦ Cleanup`)**: *Trim Spaces*, *No Blank Lines*, *Unwrap Lines*, *ASCII Only*, *Deduplicate*, *Sort A-Z*, *UPPER / lower / Title Case*, and *Find & Replace* (with Regex support).
+- **Auto-Copy**: Automatically copies extracted text to the clipboard after every grab.
+- Save results to `.txt` or store reusable **Snippets**.
 
 ### 4. Spreadsheet / Table Editor
-- Edit sel tabel langsung dengan *double-click*.
-- Tambah atau hapus baris/kolom (`+ Row`, `+ Col`, `Del Row`).
-- **Copy TSV** untuk langsung di-paste ke Excel atau Google Sheets, atau **Export CSV**.
+- Double-click any cell to edit inline.
+- Add or remove rows and columns (`+ Row`, `+ Col`, `Del Row`).
+- **Copy TSV** to paste directly into Excel or Google Sheets, or **Export CSV**.
 
 ### 5. History & Snippets
-- Riwayat grab terbaru dan snippet tersimpan secara lokal di `data/store.json` (hanya teks, bukan gambar) untuk penggunaan ulang cepat.
+- Recent grabs and saved snippets are stored locally in `data/store.json` (text only, never images) for fast reuse.
 
 ---
 
-## Instalasi & Shortcut
+## Installation & Shortcuts
 
-Jalankan [Install.bat](Install.bat) (atau klik tombol **Shortcut** di dalam aplikasi) untuk memasang shortcut ke **Desktop** dan **Start Menu** dengan ikon aplikasi:
+Run [Install.bat](Install.bat) (or click the **Shortcut** button in the app) to install Desktop and Start Menu shortcuts with the app icon:
 
-- **`Ctrl + Alt + T`** — Membuka **Text Grabber** dari mana saja di Windows (melalui shortcut Desktop / Start Menu).
-- **`Ctrl + Shift + G`** — **Grab Screen** (saat aplikasi berjalan).
-- **`Ctrl + Shift + F`** — **Grab Frame** (saat aplikasi berjalan).
-- **`Ctrl + V`** — **Paste & OCR** gambar dari clipboard.
+- **`Ctrl + Alt + T`** — Launch **Text Grabber** from anywhere in Windows (via Desktop / Start Menu shortcut).
+- **`Ctrl + Shift + G`** — **Grab Screen** (while the app is running).
+- **`Ctrl + Shift + F`** — **Grab Frame** (while the app is running).
+- **`Ctrl + V`** — **Paste & OCR** an image from the clipboard.
 
-Atau jalankan langsung tanpa instalasi shortcut lewat [TextGrabber.bat](TextGrabber.bat).
+You can also launch the app directly without installing shortcuts via [TextGrabber.bat](TextGrabber.bat).
 
 ---
 
-## Struktur Proyek
+## Project Structure
 
-| File | Deskripsi |
+| File | Description |
 | --- | --- |
-| `ocr_engine.cs` / `ocr_engine.exe` | Helper C# native yang memanggil `Windows.Media.Ocr.OcrEngine` lokal dan menghasilkan JSON teks + koordinat kata. |
-| `text_grabber_core.py` | Modul inti untuk OCR lokal, post-grab cleanup, rekonstruksi tabel (`ocr_to_table`, TSV/CSV), render PDF via PyMuPDF (`fitz`), dan penyimpanan lokal (`LocalStore`). |
-| `text_grabber_app.py` | Antarmuka desktop Windows (Tkinter, DPI-aware, dark theme Windows 11). |
-| `TextGrabber.bat` | Launcher aplikasi tanpa jendela konsol (`pythonw.exe`). |
-| `Install_Shortcut.ps1` / `Install.bat` | Installer shortcut Desktop & Start Menu (`Ctrl + Alt + T`). |
-| `app_icon.ico` | Ikon aplikasi Windows. |
-| `test_text_grabber.py` | Suite pengujian otomatis (`unittest`). |
+| `ocr_engine.cs` / `ocr_engine.exe` | Native C# helper calling local `Windows.Media.Ocr.OcrEngine` and outputting JSON with text and word bounding boxes. |
+| `text_grabber_core.py` | Core module for local OCR, post-grab cleanup, table reconstruction (`ocr_to_table`, TSV/CSV), PDF rendering via PyMuPDF (`fitz`), and local storage (`LocalStore`). |
+| `text_grabber_app.py` | Windows desktop UI (Tkinter, DPI-aware, clean light theme). |
+| `TextGrabber.bat` | Windowless launcher (`pythonw.exe`). |
+| `Install_Shortcut.ps1` / `Install.bat` | Desktop & Start Menu shortcut installer (`Ctrl + Alt + T`). |
+| `app_icon.ico` | Windows application icon. |
+| `test_text_grabber.py` | Automated test suite (`unittest`). |
 
 ---
 
-## Pengujian
+## Running Tests
 
 ```powershell
 python -m unittest test_text_grabber.py -v
