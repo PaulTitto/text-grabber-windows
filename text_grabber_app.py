@@ -6,8 +6,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import os
 import subprocess
+import sys
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
@@ -17,9 +19,13 @@ from text_grabber_core import (
     CleanupOptions,
     LocalStore,
     PdfDocument,
+    apply_preset,
     clean_text,
     deduplicate_lines,
+    detect_smart_actions,
+    extract_new_lines,
     find_replace,
+    get_resource_path,
     list_ocr_languages,
     ocr_to_table,
     run_ocr,
@@ -28,6 +34,7 @@ from text_grabber_core import (
     table_to_tsv,
     transform_case,
 )
+from win_tray import WinTrayIcon
 
 # Enable Per-Monitor DPI awareness on Windows so screen coordinates match pixels.
 try:
@@ -38,21 +45,23 @@ except Exception:
     except Exception:
         pass
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ICON_PATH = os.path.join(APP_DIR, "app_icon.ico")
-INSTALL_PS1 = os.path.join(APP_DIR, "Install_Shortcut.ps1")
+ICON_PATH = get_resource_path("app_icon.ico")
+INSTALL_PS1 = get_resource_path("Install_Shortcut.ps1")
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 
+MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 VK_G = 0x47
 VK_F = 0x46
 HOTKEY_GRAB_ID = 101
 HOTKEY_FRAME_ID = 102
+HOTKEY_GRAB_ALT_ID = 103
+HOTKEY_FRAME_ALT_ID = 104
 
 # 60-30-10 Calm Light Theme (WCAG AA compliant)
 BG_APP = "#F9FAFB"       # 60% Main background
@@ -60,12 +69,12 @@ BG_CARD = "#FFFFFF"      # 30% Card & surface background
 BG_SUBTLE = "#F3F4F6"    # Subtle secondary surface
 BG_HOVER = "#E5E7EB"     # Hover state
 FG_PRIMARY = "#111827"   # Main headings & primary text
-FG_SECONDARY = "#4B5563" # Labels & body captions (WCAG AA on #F9FAFB / #FFFFFF)
-FG_MUTED = "#6B7280"     # Muted helper text (WCAG AA on #FFFFFF)
+FG_SECONDARY = "#4B5563" # Labels & body captions
+FG_MUTED = "#6B7280"     # Muted helper text
 ACCENT = "#2563EB"       # 10% Primary CTA & active indicators
 ACCENT_HOVER = "#1D4ED8"
 ACCENT_SOFT = "#EFF6FF"
-SUCCESS = "#059669"      # Calm emerald (WCAG AA on #ECFDF5 / #F9FAFB)
+SUCCESS = "#059669"      # Calm emerald
 SUCCESS_SOFT = "#ECFDF5"
 BORDER = "#E5E7EB"       # 1px thin card border
 
@@ -189,14 +198,178 @@ class RegionOverlay(tk.Toplevel):
         self.on_cancel()
 
 
-class GrabFrameWindow(tk.Toplevel):
-    """Floating, resizable always-on-top frame for grabbing text from videos or apps."""
+class WordSelectOverlay(tk.Toplevel):
+    """Interactive word-level selector over a captured image using OCR bounding boxes."""
 
-    def __init__(self, master: tk.Tk, on_grab_rect: Any) -> None:
+    def __init__(
+        self,
+        master: tk.Tk,
+        image: Image.Image,
+        ocr_data: dict[str, Any],
+        on_done: Any,
+    ) -> None:
+        super().__init__(master)
+        self.title("Interactive Word Select — Click or Drag Words")
+        self.image = image
+        self.on_done = on_done
+        self.configure(bg=BG_APP)
+        apply_windows_titlebar(self)
+
+        sw = self.winfo_screenwidth() - 120
+        sh = self.winfo_screenheight() - 160
+        scale = min(sw / max(1, image.width), sh / max(1, image.height), 1.0)
+        self.scale = scale
+        dw, dh = max(320, int(image.width * scale)), max(200, int(image.height * scale))
+
+        bar = tk.Frame(self, bg=BG_CARD, padx=16, pady=10, highlightbackground=BORDER, highlightthickness=1)
+        bar.pack(fill="x")
+        tk.Label(
+            bar,
+            text="Click words or drag across them  •  Double-click word to copy immediately",
+            bg=BG_CARD,
+            fg=FG_SECONDARY,
+            font=(UI_FONT, 9),
+        ).pack(side="left")
+
+        tk.Button(
+            bar,
+            text="Copy Selected",
+            command=self._copy_selected,
+            bg=ACCENT,
+            fg="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=4,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+        ).pack(side="right")
+
+        tk.Button(
+            bar,
+            text="Select All",
+            command=self._select_all,
+            bg=BG_SUBTLE,
+            fg=FG_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=4,
+            font=(UI_FONT, 9),
+            cursor="hand2",
+        ).pack(side="right", padx=8)
+
+        self.canvas = tk.Canvas(self, width=dw, height=dh, bg=BG_APP, highlightthickness=0, cursor="hand2")
+        self.canvas.pack(padx=16, pady=16)
+
+        resized = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(resized)
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+        self.words: list[dict[str, Any]] = []
+        self.selected: set[int] = set()
+        self.rects: list[int] = []
+
+        for line in ocr_data.get("lines", []):
+            for w in line.get("words", []):
+                if not w.get("text", "").strip():
+                    continue
+                idx = len(self.words)
+                x0 = w["x"] * scale
+                y0 = w["y"] * scale
+                x1 = (w["x"] + w["w"]) * scale
+                y1 = (w["y"] + w["h"]) * scale
+                rect = self.canvas.create_rectangle(x0, y0, x1, y1, outline=ACCENT, width=1)
+                self.words.append({"text": w["text"], "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+                self.rects.append(rect)
+
+        self._drag_start: tuple[int, int] | None = None
+        self._drag_box: int | None = None
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-1>", self._on_double_click)
+        self.bind("<Return>", lambda _e: self._copy_selected())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.focus_force()
+
+    def _hit_word(self, x: float, y: float) -> int | None:
+        for i, w in enumerate(self.words):
+            if w["x0"] <= x <= w["x1"] and w["y0"] <= y <= w["y1"]:
+                return i
+        return None
+
+    def _refresh_boxes(self) -> None:
+        for i, rect in enumerate(self.rects):
+            if i in self.selected:
+                self.canvas.itemconfig(rect, outline=ACCENT_HOVER, width=2, fill=ACCENT_SOFT, stipple="gray25")
+            else:
+                self.canvas.itemconfig(rect, outline=ACCENT, width=1, fill="")
+
+    def _on_press(self, event: tk.Event) -> None:
+        self._drag_start = (event.x, event.y)
+        if self._drag_box:
+            self.canvas.delete(self._drag_box)
+        self._drag_box = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=ACCENT, width=2)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_start and self._drag_box:
+            self.canvas.coords(self._drag_box, self._drag_start[0], self._drag_start[1], event.x, event.y)
+
+    def _on_release(self, event: tk.Event) -> None:
+        if self._drag_box:
+            self.canvas.delete(self._drag_box)
+            self._drag_box = None
+        if not self._drag_start:
+            return
+        x0, y0 = min(self._drag_start[0], event.x), min(self._drag_start[1], event.y)
+        x1, y1 = max(self._drag_start[0], event.x), max(self._drag_start[1], event.y)
+        self._drag_start = None
+
+        if x1 - x0 < 5 and y1 - y0 < 5:
+            idx = self._hit_word(event.x, event.y)
+            if idx is not None:
+                if idx in self.selected:
+                    self.selected.remove(idx)
+                else:
+                    self.selected.add(idx)
+        else:
+            for i, w in enumerate(self.words):
+                if not (w["x1"] < x0 or w["x0"] > x1 or w["y1"] < y0 or w["y0"] > y1):
+                    self.selected.add(i)
+        self._refresh_boxes()
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        idx = self._hit_word(event.x, event.y)
+        if idx is not None:
+            self.selected = {idx}
+            self._copy_selected()
+
+    def _select_all(self) -> None:
+        self.selected = set(range(len(self.words)))
+        self._refresh_boxes()
+
+    def _copy_selected(self) -> None:
+        if not self.selected:
+            return
+        text = " ".join(self.words[i]["text"] for i in sorted(self.selected))
+        self.destroy()
+        self.on_done(text)
+
+
+class GrabFrameWindow(tk.Toplevel):
+    """Floating always-on-top frame with manual Grab and Live Auto-Watch mode."""
+
+    def __init__(self, master: tk.Tk, on_grab_rect: Any, on_watch_rect: Any) -> None:
         super().__init__(master)
         self.on_grab_rect = on_grab_rect
+        self.on_watch_rect = on_watch_rect
+        self.watching = False
+        self._watch_job: str | None = None
+
         self.title("Grab Frame")
-        self.geometry("540x230+220+220")
+        self.geometry("560x240+220+220")
         self.attributes("-topmost", True)
         self.configure(bg="#ff00ff")
         if os.path.exists(ICON_PATH):
@@ -216,7 +389,7 @@ class GrabFrameWindow(tk.Toplevel):
 
         tk.Label(
             toolbar,
-            text="Arahkan frame ke video atau aplikasi",
+            text="Arahkan ke video / aplikasi",
             bg=BG_CARD,
             fg=FG_SECONDARY,
             font=(UI_FONT, 9),
@@ -233,32 +406,80 @@ class GrabFrameWindow(tk.Toplevel):
             font=(UI_FONT, 9, "bold"),
             relief="flat",
             bd=0,
-            padx=14,
+            padx=12,
             pady=4,
             cursor="hand2",
         ).pack(side="right")
 
+        self.watch_btn = tk.Button(
+            toolbar,
+            text="○  Watch (1.5s)",
+            command=self._toggle_watch,
+            bg=BG_SUBTLE,
+            fg=FG_PRIMARY,
+            font=(UI_FONT, 9),
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        self.watch_btn.pack(side="right", padx=(0, 8))
+
         self.hole = tk.Frame(self, bg="#ff00ff", highlightbackground=ACCENT, highlightthickness=2)
         self.hole.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
-    def _grab(self) -> None:
+    def _frame_bbox(self) -> tuple[int, int, int, int] | None:
         self.update_idletasks()
         x = self.hole.winfo_rootx()
         y = self.hole.winfo_rooty()
         w = self.hole.winfo_width()
         h = self.hole.winfo_height()
         if w < 10 or h < 10:
+            return None
+        return (x, y, x + w, y + h)
+
+    def _grab(self) -> None:
+        bbox = self._frame_bbox()
+        if not bbox:
             return
         self.withdraw()
-        self.after(90, lambda: self._capture_and_restore(x, y, x + w, y + h))
+        self.after(90, lambda: self._capture_and_restore(bbox))
 
-    def _capture_and_restore(self, x0: int, y0: int, x1: int, y1: int) -> None:
+    def _capture_and_restore(self, bbox: tuple[int, int, int, int]) -> None:
         try:
-            img = ImageGrab.grab(bbox=(x0, y0, x1, y1), all_screens=True)
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
         finally:
             if self.winfo_exists():
                 self.deiconify()
         self.on_grab_rect(img, "Grab Frame")
+
+    def _toggle_watch(self) -> None:
+        self.watching = not self.watching
+        if self.watching:
+            self.watch_btn.config(text="●  Watching", bg=SUCCESS_SOFT, fg=SUCCESS)
+            self._schedule_watch()
+        else:
+            self.watch_btn.config(text="○  Watch (1.5s)", bg=BG_SUBTLE, fg=FG_PRIMARY)
+            if self._watch_job:
+                self.after_cancel(self._watch_job)
+                self._watch_job = None
+
+    def _schedule_watch(self) -> None:
+        if not self.watching or not self.winfo_exists():
+            return
+        bbox = self._frame_bbox()
+        if bbox:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            self.on_watch_rect(img)
+        self._watch_job = self.after(1500, self._schedule_watch)
+
+    def _close(self) -> None:
+        self.watching = False
+        if self._watch_job:
+            self.after_cancel(self._watch_job)
+        self.destroy()
 
 
 class TextGrabberApp(tk.Tk):
@@ -268,7 +489,7 @@ class TextGrabberApp(tk.Tk):
         super().__init__()
         self.title("Text Grabber")
         self.geometry("1160x740")
-        self.minsize(900, 600)
+        self.minsize(920, 600)
         self.configure(bg=BG_APP)
         if os.path.exists(ICON_PATH):
             try:
@@ -288,6 +509,8 @@ class TextGrabberApp(tk.Tk):
 
         self._preview_visible = True
         self._cleanup_visible = False
+        self._silent_mode = False
+        self._watch_seen_lines: set[str] = set()
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._preview_scale: float = 1.0
         self._preview_offset: tuple[int, int] = (0, 0)
@@ -301,8 +524,21 @@ class TextGrabberApp(tk.Tk):
         self._configure_styles()
         self._build_ui()
         self._refresh_history_and_snippets()
+        self._refresh_presets_combo()
         self._start_global_hotkey_listener()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.tray = WinTrayIcon(
+            icon_path=ICON_PATH,
+            tooltip="Text Grabber — Local Offline OCR",
+            on_open=lambda: self.after(0, self._restore_from_tray),
+            on_grab=lambda: self.after(0, self.start_fullscreen_grab),
+            on_frame=lambda: self.after(0, self.open_grab_frame),
+            on_toggle_silent=lambda: self.after(0, self._toggle_silent_mode),
+            is_silent=lambda: self._silent_mode,
+            on_exit=lambda: self.after(0, self._quit_app),
+        )
+        self.tray.start()
+        self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -337,23 +573,16 @@ class TextGrabberApp(tk.Tk):
         style.map("Treeview", background=[("selected", ACCENT_SOFT)], foreground=[("selected", ACCENT)])
 
     def _build_ui(self) -> None:
-        # 1. Above-the-fold Header Card (8px grid: padx=24, pady=16)
+        # 1. Above-the-fold Header Card
         header_wrap = tk.Frame(self, bg=BG_APP, padx=24, pady=16)
         header_wrap.pack(fill="x")
 
-        # Title & Status Row
         title_row = tk.Frame(header_wrap, bg=BG_APP)
         title_row.pack(fill="x", pady=(0, 16))
 
         title_left = tk.Frame(title_row, bg=BG_APP)
         title_left.pack(side="left")
-        tk.Label(
-            title_left,
-            text="Text Grabber",
-            bg=BG_APP,
-            fg=FG_PRIMARY,
-            font=(UI_FONT, 16, "bold"),
-        ).pack(anchor="w")
+        tk.Label(title_left, text="Text Grabber", bg=BG_APP, fg=FG_PRIMARY, font=(UI_FONT, 16, "bold")).pack(anchor="w")
         tk.Label(
             title_left,
             text="Ekstrak teks dari gambar, video, PDF, dan layar secara lokal",
@@ -362,7 +591,6 @@ class TextGrabberApp(tk.Tk):
             font=(UI_FONT, 9),
         ).pack(anchor="w", pady=(2, 0))
 
-        # Status & Summary Chips (Right side of header)
         chips = tk.Frame(title_row, bg=BG_APP)
         chips.pack(side="right")
 
@@ -389,41 +617,32 @@ class TextGrabberApp(tk.Tk):
             pady=6,
         ).pack(side="left", padx=(0, 8))
 
+        self.silent_btn = self._btn(chips, "◔  Silent: Off", self._toggle_silent_mode, outline=True)
+        self.silent_btn.pack(side="left", padx=(0, 8))
         self._btn(chips, "⌘  Shortcut", self.install_windows_shortcut, outline=True).pack(side="left")
 
-        # 2. Action Toolbar Card (White card with 1px #E5E7EB border, 16px internal padding)
-        toolbar_card = tk.Frame(
-            header_wrap,
-            bg=BG_CARD,
-            padx=16,
-            pady=12,
-            highlightbackground=BORDER,
-            highlightthickness=1,
-        )
+        # 2. Action Toolbar Card
+        toolbar_card = tk.Frame(header_wrap, bg=BG_CARD, padx=16, pady=12, highlightbackground=BORDER, highlightthickness=1)
         toolbar_card.pack(fill="x")
 
-        # Primary CTA + Secondary Outline Actions (uniform outline icons)
         self._btn(toolbar_card, "⌖  Grab Screen", self.start_fullscreen_grab, accent=True).pack(side="left", padx=(0, 8))
         self._btn(toolbar_card, "⛶  Frame", self.open_grab_frame, outline=True).pack(side="left", padx=(0, 8))
         self._btn(toolbar_card, "◫  Open File", self.open_file_dialog, outline=True).pack(side="left", padx=(0, 8))
         self._btn(toolbar_card, "⎘  Paste", self.paste_clipboard_image, outline=True).pack(side="left")
 
-        # Vertical Divider
-        tk.Frame(toolbar_card, width=1, bg=BORDER).pack(side="left", fill="y", padx=16, pady=2)
+        tk.Frame(toolbar_card, width=1, bg=BORDER).pack(side="left", fill="y", padx=14, pady=2)
 
-        # Segmented Mode Switcher
-        tk.Label(toolbar_card, text="Mode", bg=BG_CARD, fg=FG_MUTED, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 8))
         self.mode_var = tk.StringVar(value="Standard")
         seg = tk.Frame(toolbar_card, bg=BG_SUBTLE, padx=4, pady=4, highlightbackground=BORDER, highlightthickness=1)
-        seg.pack(side="left", padx=(0, 16))
-        for label, val in [("Standard", "Standard"), ("1-Line", "Single Line"), ("Table", "Table")]:
+        seg.pack(side="left", padx=(0, 12))
+        for label, val in [("Standard", "Standard"), ("1-Line", "Single Line"), ("Table", "Table"), ("Words", "Words")]:
             b = tk.Button(
                 seg,
                 text=label,
                 command=lambda v=val: self._set_mode(v),
                 relief="flat",
                 bd=0,
-                padx=10,
+                padx=9,
                 pady=3,
                 font=(UI_FONT, 8, "bold"),
                 cursor="hand2",
@@ -434,7 +653,7 @@ class TextGrabberApp(tk.Tk):
 
         lang_values = [l["tag"] for l in self.languages] or ["en-US"]
         self.lang_var = tk.StringVar(value=lang_values[0])
-        ttk.Combobox(toolbar_card, textvariable=self.lang_var, values=lang_values, state="readonly", width=7).pack(side="left", padx=(0, 12))
+        ttk.Combobox(toolbar_card, textvariable=self.lang_var, values=lang_values, state="readonly", width=7).pack(side="left", padx=(0, 10))
 
         self.auto_copy_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
@@ -452,11 +671,11 @@ class TextGrabberApp(tk.Tk):
         self.toggle_preview_btn = self._btn(toolbar_card, "◧  Hide Preview", self._toggle_preview, ghost=True)
         self.toggle_preview_btn.pack(side="right")
 
-        # 3. Main Content Area (24px outer horizontal padding, 16px gap)
+        # 3. Main Content Area
         self.paned = tk.PanedWindow(self, orient="horizontal", bg=BG_APP, sashwidth=16, sashrelief="flat")
         self.paned.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
-        # Left Card: Source Preview (16px internal padding)
+        # Left Card: Source Preview
         self.left_frame = tk.Frame(self.paned, bg=BG_CARD, highlightbackground=BORDER, highlightthickness=1)
         self.paned.add(self.left_frame, width=420)
 
@@ -475,7 +694,6 @@ class TextGrabberApp(tk.Tk):
         self.preview_canvas.bind("<B1-Motion>", self._preview_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._preview_release)
 
-        # PDF Navigation Bar (shown when PDF is loaded)
         self.pdf_bar = tk.Frame(self.left_frame, bg=BG_SUBTLE, padx=16, pady=10)
         self._btn(self.pdf_bar, "◀", lambda: self._pdf_step(-1), small=True, outline=True).pack(side="left")
         self.pdf_page_label = tk.Label(self.pdf_bar, text="1 / 1", bg=BG_SUBTLE, fg=FG_PRIMARY, font=(UI_FONT, 9, "bold"))
@@ -483,7 +701,7 @@ class TextGrabberApp(tk.Tk):
         self._btn(self.pdf_bar, "▶", lambda: self._pdf_step(1), small=True, outline=True).pack(side="left")
         self._btn(self.pdf_bar, "OCR All Pages", self.ocr_all_pdf_pages, small=True, accent=True).pack(side="right")
 
-        # Right Card: Clean 3-Item Navigation (Editor | Table | History)
+        # Right Card: 3-Item Navigation
         self.right_frame = tk.Frame(self.paned, bg=BG_CARD, highlightbackground=BORDER, highlightthickness=1)
         self.paned.add(self.right_frame, width=680)
 
@@ -521,10 +739,12 @@ class TextGrabberApp(tk.Tk):
         # 4. Minimal Footer
         footer = tk.Frame(self, bg=BG_APP, padx=24, pady=10)
         footer.pack(fill="x", side="bottom")
-        self.status_var = tk.StringVar(value="Siap  •  Ctrl+Shift+G Grab Screen  •  Ctrl+Shift+F Frame  •  Ctrl+Alt+T Launch")
+        self.status_var = tk.StringVar(value="Siap  •  Ctrl+N / Ctrl+G / Ctrl+Shift+G Grab Screen  •  Ctrl+Shift+F Frame")
         tk.Label(footer, textvariable=self.status_var, bg=BG_APP, fg=FG_MUTED, anchor="w", font=(UI_FONT, 8)).pack(side="left")
 
         self.bind("<Control-v>", lambda _e: self._on_ctrl_v())
+        self.bind("<Control-n>", lambda _e: self.start_fullscreen_grab())
+        self.bind("<Control-g>", lambda _e: self.start_fullscreen_grab())
 
     def _switch_view(self, key: str) -> None:
         for k, frame in self.views.items():
@@ -559,7 +779,20 @@ class TextGrabberApp(tk.Tk):
         self._btn(bar, "+ Snippet", self.save_editor_as_snippet, small=True, outline=True).pack(side="right", padx=(0, 8))
         self._btn(bar, "Save .txt", self.save_editor_txt, small=True, outline=True).pack(side="right", padx=(0, 8))
 
+        # Smart Quick-Actions Bar (hidden until URLs/emails/phones/JSON detected)
+        self.smart_bar = tk.Frame(tab, bg=ACCENT_SOFT, padx=16, pady=8)
+
+        # Collapsible Cleanup & Presets Drawer
         self.cleanup_drawer = tk.Frame(tab, bg=BG_SUBTLE, padx=16, pady=12, highlightbackground=BORDER, highlightthickness=1)
+
+        row_preset = tk.Frame(self.cleanup_drawer, bg=BG_SUBTLE)
+        row_preset.pack(fill="x", pady=(0, 8))
+        tk.Label(row_preset, text="Preset:", bg=BG_SUBTLE, fg=FG_SECONDARY, font=(UI_FONT, 8, "bold")).pack(side="left")
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(row_preset, textvariable=self.preset_var, state="readonly", width=22)
+        self.preset_combo.pack(side="left", padx=8)
+        self._btn(row_preset, "Apply Preset", self._apply_selected_preset, small=True, accent=True).pack(side="left", padx=(0, 6))
+        self._btn(row_preset, "+ Save Preset", self._save_current_preset, small=True, outline=True).pack(side="left")
 
         row1 = tk.Frame(self.cleanup_drawer, bg=BG_SUBTLE)
         row1.pack(fill="x", pady=(0, 8))
@@ -583,7 +816,7 @@ class TextGrabberApp(tk.Tk):
                 activebackground=BG_SUBTLE,
                 font=(UI_FONT, 8),
             ).pack(side="left", padx=(0, 10))
-        self._btn(row1, "Apply Cleanup", self.apply_cleanup_now, small=True, accent=True).pack(side="right")
+        self._btn(row1, "Apply Cleanup", self.apply_cleanup_now, small=True, outline=True).pack(side="right")
 
         row2 = tk.Frame(self.cleanup_drawer, bg=BG_SUBTLE)
         row2.pack(fill="x", pady=(0, 8))
@@ -637,7 +870,7 @@ class TextGrabberApp(tk.Tk):
         self.editor.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.editor.pack(fill="both", expand=True)
-        self.editor.bind("<KeyRelease>", lambda _e: self._update_counts())
+        self.editor.bind("<KeyRelease>", lambda _e: self._on_editor_change())
 
     def _build_table_tab(self) -> None:
         tab = tk.Frame(self.view_container, bg=BG_CARD)
@@ -759,6 +992,31 @@ class TextGrabberApp(tk.Tk):
         btn.bind("<Leave>", lambda _e: btn.config(bg=bg))
         return btn
 
+    # --- Tray & Silent Mode ---
+    def _toggle_silent_mode(self) -> None:
+        self._silent_mode = not self._silent_mode
+        if self._silent_mode:
+            self.silent_btn.config(text="●  Silent: On", bg=ACCENT_SOFT, fg=ACCENT)
+            self.status_var.set("Silent Mode aktif — hasil grab langsung ke clipboard & notifikasi.")
+        else:
+            self.silent_btn.config(text="◔  Silent: Off", bg=BG_CARD, fg=FG_PRIMARY)
+            self.status_var.set("Silent Mode nonaktif.")
+
+    def _minimize_to_tray(self) -> None:
+        self.withdraw()
+        self.tray.show_toast("Text Grabber", "Berjalan di System Tray. Tekan Ctrl+Shift+G untuk grab layar.")
+
+    def _restore_from_tray(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _quit_app(self) -> None:
+        self._hotkey_stop.set()
+        self._close_pdf()
+        self.tray.stop()
+        self.destroy()
+
     def _toggle_preview(self) -> None:
         if self._preview_visible:
             self.paned.forget(self.left_frame)
@@ -796,31 +1054,52 @@ class TextGrabberApp(tk.Tk):
         else:
             messagebox.showerror("Install Error", proc.stderr or "Gagal membuat shortcut.")
 
-    # --- Global Hotkeys (Ctrl+Shift+G, Ctrl+Shift+F) ---
+    # --- Global Hotkeys (Ctrl+Alt+G / Ctrl+Shift+G, Ctrl+Alt+F / Ctrl+Shift+F) ---
     def _start_global_hotkey_listener(self) -> None:
         def worker() -> None:
             user32 = ctypes.windll.user32
-            user32.RegisterHotKey(None, HOTKEY_GRAB_ID, MOD_CONTROL | MOD_SHIFT, VK_G)
-            user32.RegisterHotKey(None, HOTKEY_FRAME_ID, MOD_CONTROL | MOD_SHIFT, VK_F)
+            registered: list[int] = []
+            grab_labels: list[str] = []
+            frame_labels: list[str] = []
+
+            if user32.RegisterHotKey(None, HOTKEY_GRAB_ALT_ID, MOD_CONTROL | MOD_ALT, VK_G):
+                registered.append(HOTKEY_GRAB_ALT_ID)
+                grab_labels.append("Ctrl+Alt+G")
+            if user32.RegisterHotKey(None, HOTKEY_GRAB_ID, MOD_CONTROL | MOD_SHIFT, VK_G):
+                registered.append(HOTKEY_GRAB_ID)
+                grab_labels.append("Ctrl+Shift+G")
+
+            if user32.RegisterHotKey(None, HOTKEY_FRAME_ALT_ID, MOD_CONTROL | MOD_ALT, VK_F):
+                registered.append(HOTKEY_FRAME_ALT_ID)
+                frame_labels.append("Ctrl+Alt+F")
+            if user32.RegisterHotKey(None, HOTKEY_FRAME_ID, MOD_CONTROL | MOD_SHIFT, VK_F):
+                registered.append(HOTKEY_FRAME_ID)
+                frame_labels.append("Ctrl+Shift+F")
+
+            grab_str = " / ".join(grab_labels) or "unavailable"
+            frame_str = " / ".join(frame_labels) or "unavailable"
+            self.after(0, lambda: self.status_var.set(f"Global Hotkey aktif: {grab_str} (Grab)  •  {frame_str} (Frame)"))
+
             msg = wintypes.MSG()
             try:
                 while not self._hotkey_stop.is_set():
                     if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
                         if msg.message == 0x0312:
-                            if msg.wParam == HOTKEY_GRAB_ID:
+                            if msg.wParam in (HOTKEY_GRAB_ID, HOTKEY_GRAB_ALT_ID):
                                 self.after(0, self.start_fullscreen_grab)
-                            elif msg.wParam == HOTKEY_FRAME_ID:
+                            elif msg.wParam in (HOTKEY_FRAME_ID, HOTKEY_FRAME_ALT_ID):
                                 self.after(0, self.open_grab_frame)
                     else:
                         self._hotkey_stop.wait(0.08)
             finally:
-                user32.UnregisterHotKey(None, HOTKEY_GRAB_ID)
-                user32.UnregisterHotKey(None, HOTKEY_FRAME_ID)
+                for hk_id in registered:
+                    user32.UnregisterHotKey(None, hk_id)
 
         threading.Thread(target=worker, daemon=True).start()
 
     # --- Capture Modes ---
     def start_fullscreen_grab(self) -> None:
+        self._was_visible_before_grab = self.state() != "withdrawn"
         self.withdraw()
         self.after(160, self._launch_overlay)
 
@@ -829,15 +1108,17 @@ class TextGrabberApp(tk.Tk):
         screenshot = ImageGrab.grab(all_screens=True)
 
         def on_capture(cropped: Image.Image) -> None:
-            self.deiconify()
-            self.lift()
+            if not self._silent_mode and getattr(self, "_was_visible_before_grab", True):
+                self.deiconify()
+                self.lift()
             self._close_pdf()
             self._set_preview_image(cropped, "Screen Grab")
             self._run_ocr_async(cropped, "Screen Grab")
 
         def on_cancel() -> None:
-            self.deiconify()
-            self.lift()
+            if not self._silent_mode and getattr(self, "_was_visible_before_grab", True):
+                self.deiconify()
+                self.lift()
             self.status_var.set("Grab dibatalkan.")
 
         RegionOverlay(self, screenshot, bounds, self.mode_var.get(), on_capture, on_cancel)
@@ -846,13 +1127,38 @@ class TextGrabberApp(tk.Tk):
         if self._grab_frame and self._grab_frame.winfo_exists():
             self._grab_frame.lift()
             return
+        self._watch_seen_lines.clear()
 
         def on_grab(img: Image.Image, source: str) -> None:
             self._close_pdf()
             self._set_preview_image(img, source)
             self._run_ocr_async(img, source)
 
-        self._grab_frame = GrabFrameWindow(self, on_grab)
+        def on_watch(img: Image.Image) -> None:
+            lang_tag = self.lang_var.get() or None
+
+            def worker() -> None:
+                try:
+                    data = run_ocr(img, lang_tag)
+                    added, updated = extract_new_lines(self._watch_seen_lines, data.get("text", ""))
+                    if added:
+                        self._watch_seen_lines = updated
+                        self.after(0, lambda lines=added: self._append_watch_lines(lines))
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self._grab_frame = GrabFrameWindow(self, on_grab, on_watch)
+
+    def _append_watch_lines(self, lines: list[str]) -> None:
+        current = self.get_editor_text()
+        addition = "\n".join(lines)
+        new_text = f"{current}\n{addition}".strip() if current.strip() else addition
+        self._set_editor_text(new_text)
+        if self.auto_copy_var.get():
+            self._copy_text(new_text)
+        self.status_var.set(f"Live Watch: +{len(lines)} baris baru.")
 
     def open_file_dialog(self) -> None:
         path = filedialog.askopenfilename(
@@ -1039,14 +1345,22 @@ class TextGrabberApp(tk.Tk):
         def worker() -> None:
             try:
                 data = run_ocr(img, lang_tag)
-                self.after(0, lambda: self._on_ocr_complete(data, source, mode))
+                self.after(0, lambda: self._on_ocr_complete(img, data, source, mode))
             except Exception as exc:
                 self.after(0, lambda: self.status_var.set(f"OCR error: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ocr_complete(self, data: dict[str, Any], source: str, mode: str) -> None:
+    def _on_ocr_complete(self, img: Image.Image, data: dict[str, Any], source: str, mode: str) -> None:
         self.current_ocr_data = data
+        if mode == "Words":
+            WordSelectOverlay(
+                self,
+                img,
+                data,
+                lambda selected_text: self._apply_text_result(selected_text, source, "Words"),
+            )
+            return
         if mode == "Table":
             table = ocr_to_table(data)
             self._load_table(table)
@@ -1059,27 +1373,112 @@ class TextGrabberApp(tk.Tk):
         self._set_editor_text(text)
         self.store.add_history(text, source, mode)
         self._refresh_history_and_snippets()
-        if self.auto_copy_var.get() and text.strip():
+        if (self.auto_copy_var.get() or self._silent_mode) and text.strip():
             self._copy_text(text)
+            words = len(text.split())
             self.status_var.set(f"Teks diambil ({source}) dan disalin ke clipboard.")
+            if self._silent_mode:
+                self.tray.show_toast("Text Grabber", f"Disalin ke clipboard ({words} kata)")
         else:
             self.status_var.set(f"Teks diambil ({source}).")
         self._switch_view("table" if switch_to_table else "editor")
 
-    # --- Editor & Cleanup ---
+    # --- Editor, Smart Quick-Actions & Presets ---
     def get_editor_text(self) -> str:
         return self.editor.get("1.0", "end-1c")
 
     def _set_editor_text(self, text: str) -> None:
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", text)
+        self._on_editor_change()
+
+    def _on_editor_change(self) -> None:
         self._update_counts()
+        self._update_smart_actions()
 
     def _update_counts(self) -> None:
         txt = self.get_editor_text()
         chars = len(txt)
         words = len(txt.split()) if txt.strip() else 0
         self.counts_label.config(text=f"{chars} chars  •  {words} words")
+
+    def _update_smart_actions(self) -> None:
+        for child in self.smart_bar.winfo_children():
+            child.destroy()
+        info = detect_smart_actions(self.get_editor_text())
+        actions: list[tuple[str, Any]] = []
+        if info["urls"]:
+            url = info["urls"][0]
+            actions.append((f"↗  Open URL ({len(info['urls'])})", lambda u=url: webbrowser.open(u)))
+        if info["emails"]:
+            emails_txt = "\n".join(info["emails"])
+            actions.append((f"✉  Copy Email ({len(info['emails'])})", lambda t=emails_txt: self._copy_and_notify(t, "Email disalin.")))
+        if info["phones"]:
+            phones_txt = "\n".join(info["phones"])
+            actions.append((f"☎  Copy Phone ({len(info['phones'])})", lambda t=phones_txt: self._copy_and_notify(t, "Nomor telepon disalin.")))
+        if info["formatted_json"]:
+            pretty = info["formatted_json"]
+            actions.append(("{ }  Format JSON", lambda p=pretty: self._set_editor_text(p)))
+
+        if not actions:
+            self.smart_bar.pack_forget()
+            return
+
+        tk.Label(self.smart_bar, text="Quick Actions:", bg=ACCENT_SOFT, fg=ACCENT, font=(UI_FONT, 8, "bold")).pack(side="left", padx=(0, 8))
+        for label, cmd in actions:
+            b = tk.Button(
+                self.smart_bar,
+                text=label,
+                command=cmd,
+                bg=BG_CARD,
+                fg=ACCENT,
+                activebackground=BG_SUBTLE,
+                relief="flat",
+                bd=0,
+                highlightbackground=BORDER,
+                highlightthickness=1,
+                padx=10,
+                pady=3,
+                font=(UI_FONT, 8, "bold"),
+                cursor="hand2",
+            )
+            b.pack(side="left", padx=(0, 6))
+        self.smart_bar.pack(fill="x", before=self.editor)
+
+    def _copy_and_notify(self, text: str, msg: str) -> None:
+        self._copy_text(text)
+        self.status_var.set(msg)
+
+    def _refresh_presets_combo(self) -> None:
+        names = [p["name"] for p in self.store.presets]
+        self.preset_combo["values"] = names
+        if names and self.preset_var.get() not in names:
+            self.preset_var.set(names[0])
+
+    def _apply_selected_preset(self) -> None:
+        name = self.preset_var.get()
+        preset = next((p for p in self.store.presets if p["name"] == name), None)
+        if preset:
+            self._set_editor_text(apply_preset(self.get_editor_text(), preset))
+            self.status_var.set(f"Preset '{name}' diterapkan.")
+
+    def _save_current_preset(self) -> None:
+        name = simpledialog.askstring("Save Preset", "Nama preset:", parent=self)
+        if not name:
+            return
+        preset = {
+            "name": name.strip(),
+            "trim_lines": self.opt_trim.get(),
+            "remove_blank_lines": self.opt_no_blank.get(),
+            "unwrap_paragraphs": self.opt_unwrap.get(),
+            "single_line": False,
+            "remove_non_ascii": self.opt_ascii.get(),
+            "extract_pattern": "",
+        }
+        self.store.add_preset(preset)
+        self._refresh_presets_combo()
+        self.preset_var.set(preset["name"])
+        self.status_var.set(f"Preset '{preset['name']}' tersimpan.")
 
     def apply_cleanup_now(self) -> None:
         self._set_editor_text(clean_text(self.get_editor_text(), self._current_cleanup_options()))
@@ -1262,14 +1661,11 @@ class TextGrabberApp(tk.Tk):
             self.store.delete_snippet(sel[0])
             self._refresh_history_and_snippets()
 
-    def _on_close(self) -> None:
-        self._hotkey_stop.set()
-        self._close_pdf()
-        self.destroy()
-
 
 def main() -> None:
     app = TextGrabberApp()
+    if "--grab" in sys.argv[1:]:
+        app.after(200, app.start_fullscreen_grab)
     app.mainloop()
 
 

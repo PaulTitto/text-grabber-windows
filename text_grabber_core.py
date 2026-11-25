@@ -9,6 +9,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,8 +18,15 @@ from typing import Any
 import fitz  # PyMuPDF
 from PIL import Image
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-OCR_EXE = os.path.join(APP_DIR, "ocr_engine.exe")
+
+def get_resource_path(filename: str) -> str:
+    """Resolve bundled resource path for both source runs and PyInstaller .exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
+
+
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+OCR_EXE = get_resource_path("ocr_engine.exe")
 DATA_DIR = os.path.join(APP_DIR, "data")
 STORE_PATH = os.path.join(DATA_DIR, "store.json")
 
@@ -348,14 +356,120 @@ class PdfDocument:
         self._doc.close()
 
 
+_URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-\(\)]{7,}\d)")
+
+DEFAULT_PRESETS: list[dict[str, Any]] = [
+    {
+        "name": "Clean PDF Paragraph",
+        "trim_lines": True,
+        "remove_blank_lines": False,
+        "unwrap_paragraphs": True,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": "",
+    },
+    {
+        "name": "Single Clean Line",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": True,
+        "remove_non_ascii": False,
+        "extract_pattern": "",
+    },
+    {
+        "name": "Extract Emails",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    },
+    {
+        "name": "Extract URLs",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"https?://[^\s<>\"'\]\)]+",
+    },
+    {
+        "name": "Extract Numbers",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"-?\d+(?:[.,]\d+)?",
+    },
+]
+
+
+def detect_smart_actions(text: str) -> dict[str, Any]:
+    """Detect actionable entities (URLs, emails, phones, JSON) in grabbed text."""
+    stripped = text.strip()
+    urls = list(dict.fromkeys(_URL_RE.findall(text)))
+    emails = list(dict.fromkeys(_EMAIL_RE.findall(text)))
+    phones = list(dict.fromkeys(p.strip() for p in _PHONE_RE.findall(text) if sum(c.isdigit() for c in p) >= 8))
+
+    formatted_json: str | None = None
+    if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+        try:
+            parsed = json.loads(stripped)
+            formatted_json = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            formatted_json = None
+
+    return {
+        "urls": urls,
+        "emails": emails,
+        "phones": phones,
+        "formatted_json": formatted_json,
+    }
+
+
+def extract_new_lines(seen_lines: set[str], new_text: str) -> tuple[list[str], set[str]]:
+    """Return newly observed non-empty lines for live Grab Frame watching."""
+    added: list[str] = []
+    updated = set(seen_lines)
+    for raw in new_text.replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if line and line not in updated:
+            updated.add(line)
+            added.append(line)
+    return added, updated
+
+
+def apply_preset(text: str, preset: dict[str, Any]) -> str:
+    """Apply a named cleanup/extraction preset to text."""
+    pattern = preset.get("extract_pattern", "").strip()
+    if pattern:
+        matches = re.findall(pattern, text)
+        return "\n".join(dict.fromkeys(m if isinstance(m, str) else " ".join(m) for m in matches))
+
+    opts = CleanupOptions(
+        trim_lines=bool(preset.get("trim_lines", True)),
+        remove_blank_lines=bool(preset.get("remove_blank_lines", False)),
+        unwrap_paragraphs=bool(preset.get("unwrap_paragraphs", False)),
+        single_line=bool(preset.get("single_line", False)),
+        remove_non_ascii=bool(preset.get("remove_non_ascii", False)),
+    )
+    return clean_text(text, opts)
+
+
 class LocalStore:
-    """Persists grab history and reusable text snippets locally."""
+    """Persists grab history, reusable text snippets, and custom cleanup presets locally."""
 
     def __init__(self, path: str = STORE_PATH, max_history: int = 50) -> None:
         self.path = path
         self.max_history = max_history
         self.history: list[dict[str, str]] = []
         self.snippets: list[dict[str, str]] = []
+        self.presets: list[dict[str, Any]] = [dict(p) for p in DEFAULT_PRESETS]
         self.load()
 
     def load(self) -> None:
@@ -366,6 +480,9 @@ class LocalStore:
                 data = json.load(f)
             self.history = data.get("history", [])[: self.max_history]
             self.snippets = data.get("snippets", [])
+            saved_presets = data.get("presets")
+            if isinstance(saved_presets, list) and saved_presets:
+                self.presets = saved_presets
         except (OSError, json.JSONDecodeError):
             self.history = []
             self.snippets = []
@@ -373,7 +490,16 @@ class LocalStore:
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
-            json.dump({"history": self.history[: self.max_history], "snippets": self.snippets}, f, indent=2, ensure_ascii=False)
+            json.dump(
+                {
+                    "history": self.history[: self.max_history],
+                    "snippets": self.snippets,
+                    "presets": self.presets,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
 
     def add_history(self, text: str, source: str, mode: str) -> None:
         if not text.strip():
@@ -402,3 +528,11 @@ class LocalStore:
         if 0 <= index < len(self.snippets):
             self.snippets.pop(index)
             self.save()
+
+    def add_preset(self, preset: dict[str, Any]) -> None:
+        name = (preset.get("name") or "").strip()
+        if not name:
+            return
+        self.presets = [p for p in self.presets if p.get("name") != name]
+        self.presets.insert(0, preset)
+        self.save()

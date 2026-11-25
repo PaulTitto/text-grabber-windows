@@ -9,9 +9,12 @@ __pycache__/
 venv/
 env/
 
-# Compiled binaries (build from ocr_engine.cs)
+# Compiled binaries & PyInstaller artifacts
 *.exe
 *.pdb
+*.spec
+build/
+dist/
 
 # Temporary OCR / OS / IDE files
 tg_ocr_*.png

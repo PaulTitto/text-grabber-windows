@@ -11,10 +11,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 from text_grabber_core import (
     CleanupOptions,
+    DEFAULT_PRESETS,
     LocalStore,
     PdfDocument,
+    apply_preset,
     clean_text,
     deduplicate_lines,
+    detect_smart_actions,
+    extract_new_lines,
     find_replace,
     list_ocr_languages,
     ocr_to_table,
@@ -131,8 +135,32 @@ class TestTextGrabber(unittest.TestCase):
 
     def test_app_module_imports(self) -> None:
         import text_grabber_app
+        import win_tray
 
         self.assertTrue(hasattr(text_grabber_app, "TextGrabberApp"))
+        self.assertTrue(hasattr(text_grabber_app, "WordSelectOverlay"))
+        self.assertTrue(hasattr(win_tray, "WinTrayIcon"))
+
+    def test_smart_actions_and_presets(self) -> None:
+        sample = "Contact support@example.com or visit https://example.com/docs and call +62 812-3456-7890"
+        detected = detect_smart_actions(sample)
+        self.assertEqual(detected["urls"], ["https://example.com/docs"])
+        self.assertEqual(detected["emails"], ["support@example.com"])
+        self.assertEqual(len(detected["phones"]), 1)
+
+        json_detected = detect_smart_actions('{"name":"TextGrabber","offline":true}')
+        self.assertIsNotNone(json_detected["formatted_json"])
+        self.assertIn("\n", json_detected["formatted_json"])
+
+        email_preset = next(p for p in DEFAULT_PRESETS if p["name"] == "Extract Emails")
+        self.assertEqual(apply_preset(sample, email_preset), "support@example.com")
+
+    def test_extract_new_lines_for_live_watch(self) -> None:
+        seen: set[str] = set()
+        added1, seen = extract_new_lines(seen, "Line A\nLine B\n")
+        self.assertEqual(added1, ["Line A", "Line B"])
+        added2, seen = extract_new_lines(seen, "Line B\nLine C\n")
+        self.assertEqual(added2, ["Line C"])
 
 
 if __name__ == "__main__":
