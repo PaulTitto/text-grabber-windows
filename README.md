@@ -34,10 +34,15 @@ A clean, modern Windows desktop application for extracting text trapped inside i
 - Closing the main window minimizes **Text Grabber** to the Windows System Tray.
 - Enable **Silent Mode** (`Silent: On` in the header or tray menu) to copy grabs directly to the clipboard with a Windows toast notification without popping open the main window.
 
-### 5. Spreadsheet / Table Editor
-- Double-click any cell to edit inline.
-- Add or remove rows and columns (`+ Row`, `+ Col`, `Del Row`).
+### 5. Spreadsheet / Table Editor & Data Engineer Tools
+- Double-click any cell to edit inline, or add/remove rows and columns (`+ Row`, `+ Col`, `Del Row`).
 - **Copy TSV** to paste directly into Excel or Google Sheets, or **Export CSV**.
+- **Data Engineer Exports**: Copy any table as a **SQL CTE** (`WITH grabbed_data AS (...)`), **`CREATE TABLE` DDL** (with inferred column types), **Pandas** (`pd.DataFrame`), **Polars** (`pl.DataFrame`), **JSON Records**, or **Markdown Table**.
+- **Editor → Data Tools**:
+  - **`SQL IN`**: Formats grabbed IDs/lines into a deduplicated SQL `IN (...)` list.
+  - **`→ Table`**: Parses JSON / NDJSON arrays or delimited/terminal-aligned output (`|`, CSV, TSV, `psql`/`duckdb`/`kubectl` tables) into the Table editor.
+  - **Log & Data Presets**: Built-in *Extract UUIDs*, *Extract IPv4*, *Extract Timestamps*, and *Filter Error Lines* presets.
+- **Image Enhancer**: Toggle **Invert (Dark UI)** and **High Contrast** on the Preview pane to boost OCR accuracy on dark terminals and low-contrast dashboards.
 
 ### 6. History & Snippets
 - Recent grabs, saved snippets, and custom cleanup presets are stored locally in `data/store.json` (text only, never images) for fast reuse.

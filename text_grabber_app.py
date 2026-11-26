@@ -23,15 +23,25 @@ from text_grabber_core import (
     clean_text,
     deduplicate_lines,
     detect_smart_actions,
+    enhance_image_for_ocr,
     extract_new_lines,
     find_replace,
     get_resource_path,
+    json_to_table,
     list_ocr_languages,
     ocr_to_table,
+    parse_text_to_table,
     run_ocr,
     sort_lines,
+    table_to_create_table_ddl,
     table_to_csv,
+    table_to_json_records,
+    table_to_markdown,
+    table_to_pandas_code,
+    table_to_polars_code,
+    table_to_sql_cte,
     table_to_tsv,
+    text_to_sql_in,
     transform_case,
 )
 from win_tray import WinTrayIcon
@@ -685,6 +695,33 @@ class TextGrabberApp(tk.Tk):
         self.source_label.pack(side="left")
         self._btn(left_hdr, "↻  Re-OCR", self.re_ocr_current, small=True, outline=True).pack(side="right")
 
+        enhance_bar = tk.Frame(self.left_frame, bg=BG_SUBTLE, padx=16, pady=6)
+        enhance_bar.pack(fill="x")
+        self.opt_invert = tk.BooleanVar(value=False)
+        self.opt_contrast = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            enhance_bar,
+            text="Invert (Dark UI)",
+            variable=self.opt_invert,
+            command=self._render_preview,
+            bg=BG_SUBTLE,
+            fg=FG_SECONDARY,
+            selectcolor=BG_CARD,
+            activebackground=BG_SUBTLE,
+            font=(UI_FONT, 8),
+        ).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(
+            enhance_bar,
+            text="High Contrast",
+            variable=self.opt_contrast,
+            command=self._render_preview,
+            bg=BG_SUBTLE,
+            fg=FG_SECONDARY,
+            selectcolor=BG_CARD,
+            activebackground=BG_SUBTLE,
+            font=(UI_FONT, 8),
+        ).pack(side="left")
+
         tk.Frame(self.left_frame, height=1, bg=BORDER).pack(fill="x")
 
         self.preview_canvas = tk.Canvas(self.left_frame, bg=BG_APP, highlightthickness=0, cursor="crosshair")
@@ -772,6 +809,8 @@ class TextGrabberApp(tk.Tk):
 
         self._btn(bar, "⎘  Copy", self.copy_editor_to_clipboard, accent=True, small=True).pack(side="left", padx=(0, 8))
         self._btn(bar, "✦  Cleanup", self._toggle_cleanup_drawer, small=True, outline=True).pack(side="left", padx=(0, 8))
+        self._btn(bar, "SQL IN", self.format_editor_sql_in, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(bar, "→ Table", self.parse_editor_to_table, small=True, outline=True).pack(side="left", padx=(0, 6))
         self._btn(bar, "1-Line", lambda: self._set_editor_text(clean_text(self.get_editor_text(), CleanupOptions(single_line=True))), small=True, ghost=True).pack(side="left", padx=(0, 4))
         self._btn(bar, "Unwrap", lambda: self._set_editor_text(clean_text(self.get_editor_text(), CleanupOptions(unwrap_paragraphs=True))), small=True, ghost=True).pack(side="left")
 
@@ -876,14 +915,24 @@ class TextGrabberApp(tk.Tk):
         tab = tk.Frame(self.view_container, bg=BG_CARD)
         self.views["table"] = tab
 
-        bar = tk.Frame(tab, bg=BG_CARD, padx=16, pady=12)
+        bar = tk.Frame(tab, bg=BG_CARD, padx=16, pady=10)
         bar.pack(fill="x")
-        self._btn(bar, "⎘  Copy TSV", self.copy_table_tsv, small=True, accent=True).pack(side="left", padx=(0, 8))
-        self._btn(bar, "Parse OCR", self.parse_last_ocr_as_table, small=True, outline=True).pack(side="left", padx=(0, 8))
-        self._btn(bar, "+ Row", self._table_add_row, small=True, ghost=True).pack(side="left", padx=(0, 4))
-        self._btn(bar, "+ Col", self._table_add_col, small=True, ghost=True).pack(side="left", padx=(0, 4))
+        self._btn(bar, "⎘  Copy TSV", self.copy_table_tsv, small=True, accent=True).pack(side="left", padx=(0, 6))
+        self._btn(bar, "Parse OCR", self.parse_last_ocr_as_table, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(bar, "+ Row", self._table_add_row, small=True, ghost=True).pack(side="left", padx=(0, 2))
+        self._btn(bar, "+ Col", self._table_add_col, small=True, ghost=True).pack(side="left", padx=(0, 2))
         self._btn(bar, "Del Row", self._table_del_row, small=True, ghost=True).pack(side="left")
         self._btn(bar, "Export CSV", self.export_table_csv, small=True, outline=True).pack(side="right")
+
+        export_bar = tk.Frame(tab, bg=BG_SUBTLE, padx=16, pady=8)
+        export_bar.pack(fill="x")
+        tk.Label(export_bar, text="Data Export:", bg=BG_SUBTLE, fg=FG_MUTED, font=(UI_FONT, 8, "bold")).pack(side="left", padx=(0, 8))
+        self._btn(export_bar, "SQL CTE", self.copy_table_sql, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(export_bar, "DDL", self.copy_table_ddl, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(export_bar, "Pandas", self.copy_table_pandas, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(export_bar, "Polars", self.copy_table_polars, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(export_bar, "JSON", self.copy_table_json, small=True, outline=True).pack(side="left", padx=(0, 6))
+        self._btn(export_bar, "Markdown", self.copy_table_markdown, small=True, outline=True).pack(side="left")
 
         tk.Frame(tab, height=1, bg=BORDER).pack(fill="x")
 
@@ -1279,16 +1328,21 @@ class TextGrabberApp(tk.Tk):
             )
             return
 
+        display_img = enhance_image_for_ocr(
+            self.current_image,
+            invert=self.opt_invert.get(),
+            high_contrast=self.opt_contrast.get(),
+        )
         cw = max(1, self.preview_canvas.winfo_width())
         ch = max(1, self.preview_canvas.winfo_height())
-        iw, ih = self.current_image.size
+        iw, ih = display_img.size
         scale = min((cw - 16) / iw, (ch - 16) / ih, 1.0)
         nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
         ox, oy = (cw - nw) // 2, (ch - nh) // 2
 
         self._preview_scale = scale
         self._preview_offset = (ox, oy)
-        resized = self.current_image.resize((nw, nh), Image.Resampling.LANCZOS)
+        resized = display_img.resize((nw, nh), Image.Resampling.LANCZOS)
         self._preview_photo = ImageTk.PhotoImage(resized)
         self.preview_canvas.create_image(ox, oy, anchor="nw", image=self._preview_photo)
 
@@ -1340,12 +1394,17 @@ class TextGrabberApp(tk.Tk):
     def _run_ocr_async(self, img: Image.Image, source: str) -> None:
         mode = self.mode_var.get()
         lang_tag = self.lang_var.get() or None
+        ocr_img = enhance_image_for_ocr(
+            img,
+            invert=self.opt_invert.get(),
+            high_contrast=self.opt_contrast.get(),
+        )
         self.status_var.set(f"Menjalankan OCR lokal ({mode})...")
 
         def worker() -> None:
             try:
-                data = run_ocr(img, lang_tag)
-                self.after(0, lambda: self._on_ocr_complete(img, data, source, mode))
+                data = run_ocr(ocr_img, lang_tag)
+                self.after(0, lambda: self._on_ocr_complete(ocr_img, data, source, mode))
             except Exception as exc:
                 self.after(0, lambda: self.status_var.set(f"OCR error: {exc}"))
 
@@ -1526,6 +1585,63 @@ class TextGrabberApp(tk.Tk):
             self.store.add_snippet(title, txt)
             self._refresh_history_and_snippets()
             self.status_var.set("Snippet tersimpan.")
+
+    # --- Data Engineer Tools ---
+    def format_editor_sql_in(self) -> None:
+        txt = self.get_editor_text().strip()
+        if not txt:
+            return
+        sql_in = text_to_sql_in(txt)
+        self._set_editor_text(sql_in)
+        self._copy_text(sql_in)
+        self.status_var.set("Diformat sebagai SQL IN (...) dan disalin ke clipboard.")
+
+    def parse_editor_to_table(self) -> None:
+        txt = self.get_editor_text()
+        rows: list[list[str]] = []
+        if txt.lstrip().startswith(("{", "[")):
+            try:
+                rows = json_to_table(txt)
+            except Exception:
+                rows = []
+        if not rows:
+            rows = parse_text_to_table(txt)
+        if not rows:
+            self.status_var.set("Tidak ada data tabel yang bisa diparse.")
+            return
+        self._load_table(rows)
+        self._switch_view("table")
+        self.status_var.set(f"Berhasil parse {len(rows)} baris ke Table.")
+
+    def copy_table_sql(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_sql_cte(self.table_data))
+            self.status_var.set("Tabel disalin sebagai SQL CTE.")
+
+    def copy_table_ddl(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_create_table_ddl(self.table_data))
+            self.status_var.set("Tabel disalin sebagai CREATE TABLE DDL.")
+
+    def copy_table_pandas(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_pandas_code(self.table_data))
+            self.status_var.set("Tabel disalin sebagai Pandas DataFrame.")
+
+    def copy_table_polars(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_polars_code(self.table_data))
+            self.status_var.set("Tabel disalin sebagai Polars DataFrame.")
+
+    def copy_table_json(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_json_records(self.table_data))
+            self.status_var.set("Tabel disalin sebagai JSON Records.")
+
+    def copy_table_markdown(self) -> None:
+        if self.table_data:
+            self._copy_text(table_to_markdown(self.table_data))
+            self.status_var.set("Tabel disalin sebagai Markdown Table.")
 
     # --- Spreadsheet / Table Editor ---
     def parse_last_ocr_as_table(self) -> None:

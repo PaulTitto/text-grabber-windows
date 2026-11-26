@@ -18,14 +18,24 @@ from text_grabber_core import (
     clean_text,
     deduplicate_lines,
     detect_smart_actions,
+    enhance_image_for_ocr,
     extract_new_lines,
     find_replace,
+    json_to_table,
     list_ocr_languages,
     ocr_to_table,
+    parse_text_to_table,
     run_ocr,
     sort_lines,
+    table_to_create_table_ddl,
     table_to_csv,
+    table_to_json_records,
+    table_to_markdown,
+    table_to_pandas_code,
+    table_to_polars_code,
+    table_to_sql_cte,
     table_to_tsv,
+    text_to_sql_in,
     transform_case,
 )
 
@@ -161,6 +171,63 @@ class TestTextGrabber(unittest.TestCase):
         self.assertEqual(added1, ["Line A", "Line B"])
         added2, seen = extract_new_lines(seen, "Line B\nLine C\n")
         self.assertEqual(added2, ["Line C"])
+
+    def test_data_engineer_tools_and_presets(self) -> None:
+        table = [["User ID", "Name", "Amount"], ["101", "Alice", "250.5"], ["102", "Bob", "NULL"]]
+        sql = table_to_sql_cte(table)
+        self.assertIn("WITH grabbed_data AS", sql)
+        self.assertIn("101 AS user_id", sql)
+        self.assertIn("'Alice' AS name", sql)
+
+        js = table_to_json_records(table)
+        self.assertIn('"User ID": "101"', js)
+
+        md = table_to_markdown(table)
+        self.assertIn("| User ID | Name | Amount |", md)
+
+        self.assertEqual(text_to_sql_in("101\n102, 101\n103"), "(101, 102, 103)")
+        self.assertEqual(text_to_sql_in("ord-1\nord-2"), "('ord-1', 'ord-2')")
+
+        psql_out = "+----+-------+\n| id | state |\n+----+-------+\n| 1  | ok    |\n+----+-------+"
+        self.assertEqual(parse_text_to_table(psql_out), [["id", "state"], ["1", "ok"]])
+
+        logs = "2026-11-26T09:00:00Z INFO ok\n2026-11-26T09:00:05Z ERROR failed 10.0.0.1 id=550e8400-e29b-41d4-a716-446655440000"
+        uuid_p = next(p for p in DEFAULT_PRESETS if p["name"] == "Extract UUIDs")
+        ip_p = next(p for p in DEFAULT_PRESETS if p["name"] == "Extract IPv4")
+        err_p = next(p for p in DEFAULT_PRESETS if p["name"] == "Filter Error Lines")
+        self.assertEqual(apply_preset(logs, uuid_p), "550e8400-e29b-41d4-a716-446655440000")
+        self.assertEqual(apply_preset(logs, ip_p), "10.0.0.1")
+        self.assertIn("ERROR failed", apply_preset(logs, err_p))
+
+    def test_ddl_dataframe_json_table_and_enhancer(self) -> None:
+        table = [
+            ["id", "score", "active", "created_at"],
+            ["1", "98.5", "true", "2026-11-26"],
+            ["2", "87.0", "false", "2026-11-25"],
+        ]
+        ddl = table_to_create_table_ddl(table)
+        self.assertIn("id BIGINT", ddl)
+        self.assertIn("score DOUBLE PRECISION", ddl)
+        self.assertIn("active BOOLEAN", ddl)
+        self.assertIn("created_at DATE", ddl)
+
+        pd_code = table_to_pandas_code(table)
+        self.assertIn("pd.DataFrame", pd_code)
+        self.assertIn("'id': 1", pd_code)
+
+        pl_code = table_to_polars_code(table)
+        self.assertIn("pl.DataFrame", pl_code)
+        self.assertIn("'score': [98.5, 87.0]", pl_code)
+
+        ndjson = '{"id": 1, "name": "a"}\n{"id": 2, "name": "b", "tag": "x"}'
+        parsed = json_to_table(ndjson)
+        self.assertEqual(parsed[0], ["id", "name", "tag"])
+        self.assertEqual(parsed[1], ["1", "a", ""])
+        self.assertEqual(parsed[2], ["2", "b", "x"])
+
+        dark_img = _make_text_image([(20, 20, "Dark")], size=(200, 80))
+        enhanced = enhance_image_for_ocr(dark_img, invert=True, high_contrast=True)
+        self.assertEqual(enhanced.size, (200, 80))
 
 
 if __name__ == "__main__":

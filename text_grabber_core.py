@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any
 
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 
 def get_resource_path(filename: str) -> str:
@@ -333,6 +333,229 @@ def table_to_csv(table: list[list[str]]) -> str:
     return buf.getvalue()
 
 
+def _sanitize_sql_col(name: str, fallback_idx: int) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", name.strip()).strip("_").lower()
+    if not cleaned or cleaned[0].isdigit():
+        return f"col_{fallback_idx + 1}"
+    return cleaned
+
+
+def _sql_literal(val: str) -> str:
+    v = val.strip()
+    if v == "" or v.upper() == "NULL":
+        return "NULL"
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", v):
+        return v
+    return "'" + v.replace("'", "''") + "'"
+
+
+def table_to_sql_cte(table: list[list[str]], cte_name: str = "grabbed_data") -> str:
+    """Format a 2D table as a SQL CTE (WITH ... AS (SELECT ... UNION ALL ...))."""
+    if not table:
+        return ""
+    headers = [_sanitize_sql_col(h, i) for i, h in enumerate(table[0])]
+    data_rows = table[1:] if len(table) > 1 else [[""] * len(headers)]
+    selects: list[str] = []
+    for row in data_rows:
+        cols = [f"{_sql_literal(row[i] if i < len(row) else '')} AS {headers[i]}" for i in range(len(headers))]
+        selects.append("  SELECT " + ", ".join(cols))
+    return f"WITH {cte_name} AS (\n" + "\n  UNION ALL\n".join(selects) + f"\n)\nSELECT * FROM {cte_name};"
+
+
+def table_to_json_records(table: list[list[str]]) -> str:
+    """Format a 2D table (first row as headers) as pretty JSON records."""
+    if not table:
+        return "[]"
+    headers = [h.strip() or f"col_{i + 1}" for i, h in enumerate(table[0])]
+    records = [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in table[1:]
+    ]
+    return json.dumps(records, indent=2, ensure_ascii=False)
+
+
+def table_to_markdown(table: list[list[str]]) -> str:
+    """Format a 2D table as a Markdown table."""
+    if not table:
+        return ""
+    num_cols = max(len(r) for r in table)
+    norm = [r + [""] * (num_cols - len(r)) for r in table]
+    header = "| " + " | ".join(c.replace("|", "\\|") for c in norm[0]) + " |"
+    sep = "| " + " | ".join("---" for _ in range(num_cols)) + " |"
+    body = ["| " + " | ".join(c.replace("|", "\\|") for c in row) + " |" for row in norm[1:]]
+    return "\n".join([header, sep, *body])
+
+
+def text_to_sql_in(text: str) -> str:
+    """Convert grabbed IDs/lines/values into a deduplicated SQL IN (...) list."""
+    tokens: list[str] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        for part in re.split(r"[,\t;]+", line):
+            val = part.strip().strip("'\"")
+            if val:
+                tokens.append(val)
+    unique = list(dict.fromkeys(tokens))
+    if not unique:
+        return "()"
+    all_numeric = all(re.fullmatch(r"-?\d+(?:\.\d+)?", t) for t in unique)
+    if all_numeric:
+        return "(" + ", ".join(unique) + ")"
+    escaped = ["'" + t.replace("'", "''") + "'" for t in unique]
+    return "(" + ", ".join(escaped) + ")"
+
+
+def parse_text_to_table(text: str) -> list[list[str]]:
+    """Parse delimited or terminal-aligned text (|, tab, comma, multi-space) into a 2D table."""
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
+    # Drop ASCII box-drawing / markdown separator lines like +---+---+ or |---|---|
+    lines = [ln for ln in lines if not re.fullmatch(r"[\s|+\-=:]+", ln)]
+    if not lines:
+        return []
+
+    sample = "\n".join(lines[:10])
+    if "|" in sample:
+        rows = [[c.strip() for c in ln.strip().strip("|").split("|")] for ln in lines]
+    elif "\t" in sample:
+        rows = [[c.strip() for c in ln.split("\t")] for ln in lines]
+    elif "," in sample:
+        rows = [[c.strip() for c in row] for row in csv.reader(lines)]
+    elif ";" in sample:
+        rows = [[c.strip() for c in ln.split(";")] for ln in lines]
+    else:
+        rows = [[c.strip() for c in re.split(r"\s{2,}", ln.strip())] for ln in lines]
+
+    num_cols = max((len(r) for r in rows), default=1)
+    return [r + [""] * (num_cols - len(r)) for r in rows]
+
+
+def _infer_sql_type(values: list[str]) -> str:
+    non_empty = [v.strip() for v in values if v.strip() and v.strip().upper() != "NULL"]
+    if not non_empty:
+        return "VARCHAR(255)"
+    if all(v.lower() in ("true", "false") for v in non_empty):
+        return "BOOLEAN"
+    if all(re.fullmatch(r"-?\d+", v) for v in non_empty):
+        return "BIGINT"
+    if all(re.fullmatch(r"-?\d+(?:\.\d+)?", v) for v in non_empty):
+        return "DOUBLE PRECISION"
+    if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) for v in non_empty):
+        return "DATE"
+    if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?", v) for v in non_empty):
+        return "TIMESTAMP"
+    return "VARCHAR(255)"
+
+
+def table_to_create_table_ddl(table: list[list[str]], table_name: str = "grabbed_data") -> str:
+    """Infer column types from table rows and generate a CREATE TABLE DDL statement."""
+    if not table:
+        return ""
+    headers = [_sanitize_sql_col(h, i) for i, h in enumerate(table[0])]
+    data_rows = table[1:]
+    col_defs: list[str] = []
+    for i, col_name in enumerate(headers):
+        col_vals = [r[i] if i < len(r) else "" for r in data_rows]
+        sql_type = _infer_sql_type(col_vals)
+        col_defs.append(f"  {col_name} {sql_type}")
+    return f"CREATE TABLE {table_name} (\n" + ",\n".join(col_defs) + "\n);"
+
+
+def _py_literal(val: str) -> Any:
+    v = val.strip()
+    if v == "" or v.upper() == "NULL":
+        return None
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+def table_to_pandas_code(table: list[list[str]]) -> str:
+    """Format a 2D table as a Python pandas DataFrame snippet."""
+    if not table:
+        return "import pandas as pd\ndf = pd.DataFrame([])"
+    headers = [h.strip() or f"col_{i + 1}" for i, h in enumerate(table[0])]
+    records = [
+        {headers[i]: _py_literal(row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in table[1:]
+    ]
+    return "import pandas as pd\n\ndf = pd.DataFrame(" + repr(records) + ")"
+
+
+def table_to_polars_code(table: list[list[str]]) -> str:
+    """Format a 2D table as a Python polars DataFrame snippet."""
+    if not table:
+        return "import polars as pl\ndf = pl.DataFrame({})"
+    headers = [h.strip() or f"col_{i + 1}" for i, h in enumerate(table[0])]
+    columns = {
+        headers[i]: [_py_literal(row[i] if i < len(row) else "") for row in table[1:]]
+        for i in range(len(headers))
+    }
+    return "import polars as pl\n\ndf = pl.DataFrame(" + repr(columns) + ")"
+
+
+def json_to_table(text: str) -> list[list[str]]:
+    """Convert JSON array, single JSON object, or NDJSON lines into a 2D table."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    records: list[dict[str, Any]] = []
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            records = [parsed]
+        elif isinstance(parsed, list):
+            records = [item if isinstance(item, dict) else {"value": item} for item in parsed]
+    except json.JSONDecodeError:
+        # Try NDJSON (one JSON object per line)
+        for line in stripped.splitlines():
+            ln = line.strip()
+            if not ln:
+                continue
+            obj = json.loads(ln)
+            records.append(obj if isinstance(obj, dict) else {"value": obj})
+
+    if not records:
+        return []
+
+    headers: list[str] = []
+    for rec in records:
+        for k in rec.keys():
+            ks = str(k)
+            if ks not in headers:
+                headers.append(ks)
+
+    rows: list[list[str]] = [headers]
+    for rec in records:
+        row: list[str] = []
+        for h in headers:
+            val = rec.get(h, "")
+            if isinstance(val, (dict, list)):
+                row.append(json.dumps(val, ensure_ascii=False))
+            elif val is None:
+                row.append("")
+            else:
+                row.append(str(val))
+        rows.append(row)
+    return rows
+
+
+def enhance_image_for_ocr(img: Image.Image, invert: bool = False, high_contrast: bool = False) -> Image.Image:
+    """Apply optional inversion and contrast/sharpness boost for dark or blurry screenshots."""
+    out = img.convert("RGB")
+    if invert:
+        out = ImageOps.invert(out)
+    if high_contrast:
+        out = ImageEnhance.Contrast(out).enhance(1.6)
+        out = ImageEnhance.Sharpness(out).enhance(1.4)
+    return out
+
+
 class PdfDocument:
     """Local PDF renderer using PyMuPDF (fitz)."""
 
@@ -406,6 +629,43 @@ DEFAULT_PRESETS: list[dict[str, Any]] = [
         "remove_non_ascii": False,
         "extract_pattern": r"-?\d+(?:[.,]\d+)?",
     },
+    {
+        "name": "Extract UUIDs",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+    },
+    {
+        "name": "Extract IPv4",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    },
+    {
+        "name": "Extract Timestamps",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)?\b",
+    },
+    {
+        "name": "Filter Error Lines",
+        "trim_lines": True,
+        "remove_blank_lines": True,
+        "unwrap_paragraphs": False,
+        "single_line": False,
+        "remove_non_ascii": False,
+        "extract_pattern": r"^.*(?:ERROR|FATAL|CRITICAL|Exception|Traceback).*$",
+        "regex_flags": "IM",
+    },
 ]
 
 
@@ -448,7 +708,13 @@ def apply_preset(text: str, preset: dict[str, Any]) -> str:
     """Apply a named cleanup/extraction preset to text."""
     pattern = preset.get("extract_pattern", "").strip()
     if pattern:
-        matches = re.findall(pattern, text)
+        flags = 0
+        flag_spec = preset.get("regex_flags", "")
+        if "I" in flag_spec:
+            flags |= re.IGNORECASE
+        if "M" in flag_spec:
+            flags |= re.MULTILINE
+        matches = re.findall(pattern, text, flags=flags)
         return "\n".join(dict.fromkeys(m if isinstance(m, str) else " ".join(m) for m in matches))
 
     opts = CleanupOptions(
