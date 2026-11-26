@@ -1157,7 +1157,9 @@ class TextGrabberApp(tk.Tk):
         screenshot = ImageGrab.grab(all_screens=True)
 
         def on_capture(cropped: Image.Image) -> None:
-            if not self._silent_mode and getattr(self, "_was_visible_before_grab", True):
+            # Restore window only if it was visible BEFORE the grab.
+            # Hotkey grab while app is hidden → stay hidden, result to clipboard.
+            if getattr(self, "_was_visible_before_grab", False) and not self._silent_mode:
                 self.deiconify()
                 self.lift()
             self._close_pdf()
@@ -1165,7 +1167,7 @@ class TextGrabberApp(tk.Tk):
             self._run_ocr_async(cropped, "Screen Grab")
 
         def on_cancel() -> None:
-            if not self._silent_mode and getattr(self, "_was_visible_before_grab", True):
+            if getattr(self, "_was_visible_before_grab", False) and not self._silent_mode:
                 self.deiconify()
                 self.lift()
             self.status_var.set("Grab dibatalkan.")
@@ -1432,11 +1434,14 @@ class TextGrabberApp(tk.Tk):
         self._set_editor_text(text)
         self.store.add_history(text, source, mode)
         self._refresh_history_and_snippets()
-        if (self.auto_copy_var.get() or self._silent_mode) and text.strip():
+        # Auto-copy when: auto-copy on, silent mode, or grabbed while window was hidden
+        grabbed_while_hidden = not getattr(self, "_was_visible_before_grab", True)
+        if (self.auto_copy_var.get() or self._silent_mode or grabbed_while_hidden) and text.strip():
             self._copy_text(text)
             words = len(text.split())
             self.status_var.set(f"Teks diambil ({source}) dan disalin ke clipboard.")
-            if self._silent_mode:
+            # Show toast notification when window stays hidden
+            if self._silent_mode or grabbed_while_hidden:
                 self.tray.show_toast("Text Grabber", f"Disalin ke clipboard ({words} kata)")
         else:
             self.status_var.set(f"Teks diambil ({source}).")
